@@ -175,6 +175,8 @@ TEST_F(EnvPosixTest, DISABLED_FilePermission) {
         test::TmpDir(env_) + "/testfile", test::TmpDir(env_) + "/testfile1"};
     unique_ptr<WritableFile> wfile;
     ASSERT_OK(env_->NewWritableFile(fileNames[0], &wfile, soptions));
+    ASSERT_OK(env_->NewWritableFile(fileNames[1], &wfile, soptions));
+    wfile.reset();
     unique_ptr<RandomRWFile> rwfile;
     ASSERT_OK(env_->NewRandomRWFile(fileNames[1], &rwfile, soptions));
 
@@ -188,6 +190,8 @@ TEST_F(EnvPosixTest, DISABLED_FilePermission) {
 
     env_->SetAllowNonOwnerAccess(false);
     ASSERT_OK(env_->NewWritableFile(fileNames[0], &wfile, soptions));
+    ASSERT_OK(env_->NewWritableFile(fileNames[1], &wfile, soptions));
+    wfile.reset();
     ASSERT_OK(env_->NewRandomRWFile(fileNames[1], &rwfile, soptions));
 
     for (const auto& filename : fileNames) {
@@ -199,6 +203,41 @@ TEST_F(EnvPosixTest, DISABLED_FilePermission) {
   }
 }
 #endif
+
+TEST_F(EnvPosixTest, MemoryMappedFileBuffer) {
+  const int kFileBytes = 1 << 15;  // 32 KB
+  std::string expected_data;
+  std::string fname = test::TmpDir(env_) + "/" + "testfile";
+  {
+    unique_ptr<WritableFile> wfile;
+    const EnvOptions soptions;
+    ASSERT_OK(env_->NewWritableFile(fname, &wfile, soptions));
+
+    Random rnd(301);
+    test::RandomString(&rnd, kFileBytes, &expected_data);
+    ASSERT_OK(wfile->Append(expected_data));
+  }
+
+  std::unique_ptr<MemoryMappedFileBuffer> mmap_buffer;
+  Status status = env_->NewMemoryMappedFileBuffer(fname, &mmap_buffer);
+  // it should be supported at least on linux
+#if !defined(OS_LINUX)
+  if (status.IsNotSupported()) {
+    fprintf(stderr,
+            "skipping EnvPosixTest.MemoryMappedFileBuffer due to "
+            "unsupported Env::NewMemoryMappedFileBuffer\n");
+    return;
+  }
+#endif  // !defined(OS_LINUX)
+
+  ASSERT_OK(status);
+  ASSERT_NE(nullptr, mmap_buffer.get());
+  ASSERT_NE(nullptr, mmap_buffer->base);
+  ASSERT_EQ(kFileBytes, mmap_buffer->length);
+  std::string actual_data(static_cast<char*>(mmap_buffer->base),
+                          mmap_buffer->length);
+  ASSERT_EQ(expected_data, actual_data);
+}
 
 TEST_P(EnvPosixTestWithParam, UnSchedule) {
   std::atomic<bool> called(false);
@@ -1397,6 +1436,18 @@ TEST_P(EnvPosixTestWithParam, PosixRandomRWFile) {
   env_->DeleteFile(path);
 
   std::unique_ptr<RandomRWFile> file;
+
+#ifdef OS_LINUX
+  // Cannot open non-existing file.
+  ASSERT_NOK(env_->NewRandomRWFile(path, &file, EnvOptions()));
+#endif
+
+  // Create the file using WriteableFile
+  {
+    std::unique_ptr<WritableFile> wf;
+    ASSERT_OK(env_->NewWritableFile(path, &wf, EnvOptions()));
+  }
+
   ASSERT_OK(env_->NewRandomRWFile(path, &file, EnvOptions()));
 
   char buf[10000];
@@ -1514,6 +1565,18 @@ TEST_P(EnvPosixTestWithParam, PosixRandomRWFileRandomized) {
   env_->DeleteFile(path);
 
   unique_ptr<RandomRWFile> file;
+
+#ifdef OS_LINUX
+  // Cannot open non-existing file.
+  ASSERT_NOK(env_->NewRandomRWFile(path, &file, EnvOptions()));
+#endif
+
+  // Create the file using WriteableFile
+  {
+    std::unique_ptr<WritableFile> wf;
+    ASSERT_OK(env_->NewWritableFile(path, &wf, EnvOptions()));
+  }
+
   ASSERT_OK(env_->NewRandomRWFile(path, &file, EnvOptions()));
   RandomRWFileWithMirrorString file_with_mirror(file.get());
 

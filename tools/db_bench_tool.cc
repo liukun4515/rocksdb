@@ -45,6 +45,7 @@
 #include "rocksdb/filter_policy.h"
 #include "rocksdb/memtablerep.h"
 #include "rocksdb/options.h"
+#include "options/cf_options.h"
 #include "rocksdb/perf_context.h"
 #include "rocksdb/persistent_cache.h"
 #include "rocksdb/rate_limiter.h"
@@ -150,7 +151,6 @@ DEFINE_string(
     "reads\n"
     "\treadrandomwriterandom -- N threads doing random-read, "
     "random-write\n"
-    "\tprefixscanrandom      -- prefix scan N times in random order\n"
     "\tupdaterandom  -- N threads doing read-modify-write for random "
     "keys\n"
     "\txorupdaterandom  -- N threads doing read-XOR-write for "
@@ -920,7 +920,7 @@ DEFINE_bool(use_direct_reads, rocksdb::Options().use_direct_reads,
 
 DEFINE_bool(use_direct_io_for_flush_and_compaction,
             rocksdb::Options().use_direct_io_for_flush_and_compaction,
-            "Use O_DIRECT for background flush and compaction I/O");
+            "Use O_DIRECT for background flush and compaction writes");
 
 DEFINE_bool(advise_random_on_open, rocksdb::Options().advise_random_on_open,
             "Advise random access on table file open");
@@ -992,6 +992,8 @@ DEFINE_int32(memtable_insert_with_hint_prefix_size, 0,
              "memtable insert with hint with the given prefix size.");
 DEFINE_bool(enable_io_prio, false, "Lower the background flush/compaction "
             "threads' IO priority");
+DEFINE_bool(enable_cpu_prio, false, "Lower the background flush/compaction "
+            "threads' CPU priority");
 DEFINE_bool(identity_as_first_hash, false, "the first hash function of cuckoo "
             "table becomes an identity function. This is only valid when key "
             "is 8 bytes");
@@ -3321,6 +3323,10 @@ void VerifyDBFromDB(std::string& truth_db_name) {
       FLAGS_env->LowerThreadPoolIOPriority(Env::LOW);
       FLAGS_env->LowerThreadPoolIOPriority(Env::HIGH);
     }
+    if (FLAGS_enable_cpu_prio) {
+      FLAGS_env->LowerThreadPoolCPUPriority(Env::LOW);
+      FLAGS_env->LowerThreadPoolCPUPriority(Env::HIGH);
+    }
     options.env = FLAGS_env;
 
     if (FLAGS_rate_limiter_bytes_per_sec > 0) {
@@ -3790,8 +3796,8 @@ void VerifyDBFromDB(std::string& truth_db_name) {
         MutableCFOptions mutable_cf_options(options);
         for (size_t j = 0; j < sorted_runs[i].size(); j++) {
           compactionOptions.output_file_size_limit =
-              mutable_cf_options.MaxFileSizeForLevel(
-                  static_cast<int>(output_level));
+              MaxFileSizeForLevel(mutable_cf_options,
+                  static_cast<int>(output_level), compaction_style);
           std::cout << sorted_runs[i][j].size() << std::endl;
           db->CompactFiles(compactionOptions, {sorted_runs[i][j].back().name,
                                                sorted_runs[i][j].front().name},
@@ -3842,8 +3848,8 @@ void VerifyDBFromDB(std::string& truth_db_name) {
         MutableCFOptions mutable_cf_options(options);
         for (size_t j = 0; j < sorted_runs[i].size(); j++) {
           compactionOptions.output_file_size_limit =
-              mutable_cf_options.MaxFileSizeForLevel(
-                  static_cast<int>(output_level));
+              MaxFileSizeForLevel(mutable_cf_options,
+                  static_cast<int>(output_level), compaction_style);
           db->CompactFiles(
               compactionOptions,
               {sorted_runs[i][j].back().name, sorted_runs[i][j].front().name},

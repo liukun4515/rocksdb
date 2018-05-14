@@ -42,6 +42,7 @@ class SequentialFile;
 class Slice;
 class WritableFile;
 class RandomRWFile;
+struct MemoryMappedFileBuffer;
 class Directory;
 struct DBOptions;
 struct ImmutableDBOptions;
@@ -204,6 +205,16 @@ class Env {
     return Status::NotSupported("RandomRWFile is not implemented in this Env");
   }
 
+  // Opens `fname` as a memory-mapped file for read and write (in-place updates
+  // only, i.e., no appends). On success, stores a raw buffer covering the whole
+  // file in `*result`. The file must exist prior to this call.
+  virtual Status NewMemoryMappedFileBuffer(
+      const std::string& /*fname*/,
+      unique_ptr<MemoryMappedFileBuffer>* /*result*/) {
+    return Status::NotSupported(
+        "MemoryMappedFileBuffer is not implemented in this Env");
+  }
+
   // Create an object that represents a directory. Will fail if directory
   // doesn't exist. If the directory exists, it will open the directory
   // and create a new Directory object.
@@ -246,6 +257,11 @@ class Env {
 
   // Delete the named file.
   virtual Status DeleteFile(const std::string& fname) = 0;
+
+  // Truncate the named file to the specified size.
+  virtual Status Truncate(const std::string& /*fname*/, size_t /*size*/) {
+    return Status::NotSupported("Truncate is not supported for this Env");
+  }
 
   // Create the specified directory. Returns error if directory exists.
   virtual Status CreateDir(const std::string& dirname) = 0;
@@ -396,6 +412,9 @@ class Env {
 
   // Lower IO priority for threads from the specified pool.
   virtual void LowerThreadPoolIOPriority(Priority /*pool*/ = LOW) {}
+
+  // Lower CPU priority for threads from the specified pool.
+  virtual void LowerThreadPoolCPUPriority(Priority /*pool*/ = LOW) {}
 
   // Converts seconds-since-Jan-01-1970 to a printable string
   virtual std::string TimeToString(uint64_t time) = 0;
@@ -801,6 +820,17 @@ class RandomRWFile {
   RandomRWFile& operator=(const RandomRWFile&) = delete;
 };
 
+// MemoryMappedFileBuffer object represents a memory-mapped file's raw buffer.
+// Subclasses should release the mapping upon destruction.
+struct MemoryMappedFileBuffer {
+  MemoryMappedFileBuffer(void* _base, size_t _length)
+      : base(_base), length(_length) {}
+  virtual ~MemoryMappedFileBuffer() = 0;
+
+  void* const base;
+  const size_t length;
+};
+
 // Directory object represents collection of files and implements
 // filesystem operations that can be executed on directories.
 class Directory {
@@ -1090,6 +1120,10 @@ class EnvWrapper : public Env {
 
   void LowerThreadPoolIOPriority(Priority pool = LOW) override {
     target_->LowerThreadPoolIOPriority(pool);
+  }
+
+  void LowerThreadPoolCPUPriority(Priority pool = LOW) override {
+    target_->LowerThreadPoolCPUPriority(pool);
   }
 
   std::string TimeToString(uint64_t time) override {

@@ -27,6 +27,7 @@
 #include "db/flush_scheduler.h"
 #include "db/internal_stats.h"
 #include "db/log_writer.h"
+#include "db/logs_with_prep_tracker.h"
 #include "db/pre_release_callback.h"
 #include "db/read_callback.h"
 #include "db/snapshot_checker.h"
@@ -342,6 +343,7 @@ class DBImpl : public DB {
 
   Status RunManualCompaction(ColumnFamilyData* cfd, int input_level,
                              int output_level, uint32_t output_path_id,
+                             uint32_t max_subcompactions,
                              const Slice* begin, const Slice* end,
                              bool exclusive,
                              bool disallow_trivial_move = false);
@@ -352,6 +354,10 @@ class DBImpl : public DB {
   InternalIterator* NewInternalIterator(
       Arena* arena, RangeDelAggregator* range_del_agg,
       ColumnFamilyHandle* column_family = nullptr);
+
+  LogsWithPrepTracker* logs_with_prep_tracker() {
+    return &logs_with_prep_tracker_;
+  }
 
 #ifndef NDEBUG
   // Extra methods (for testing) that are not in the public DB interface
@@ -364,9 +370,7 @@ class DBImpl : public DB {
 
   void TEST_SwitchWAL();
 
-  bool TEST_UnableToFlushOldestLog() {
-    return unable_to_flush_oldest_log_;
-  }
+  bool TEST_UnableToReleaseOldestLog() { return unable_to_release_oldest_log_; }
 
   bool TEST_IsLogGettingFlushed() {
     return alive_log_files_.begin()->getting_flushed;
@@ -593,7 +597,7 @@ class DBImpl : public DB {
                                   size_t batch_cnt) {
     recovered_transactions_[name] =
         new RecoveredTransaction(log, name, batch, seq, batch_cnt);
-    MarkLogAsContainingPrepSection(log);
+    logs_with_prep_tracker_.MarkLogAsContainingPrepSection(log);
   }
 
   void DeleteRecoveredTransaction(const std::string& name) {
@@ -601,7 +605,7 @@ class DBImpl : public DB {
     assert(it != recovered_transactions_.end());
     auto* trx = it->second;
     recovered_transactions_.erase(it);
-    MarkLogAsHavingPrepSectionFlushed(trx->log_number_);
+    logs_with_prep_tracker_.MarkLogAsHavingPrepSectionFlushed(trx->log_number_);
     delete trx;
   }
 
@@ -613,8 +617,6 @@ class DBImpl : public DB {
     recovered_transactions_.clear();
   }
 
-  void MarkLogAsHavingPrepSectionFlushed(uint64_t log);
-  void MarkLogAsContainingPrepSection(uint64_t log);
   void AddToLogsToFreeQueue(log::Writer* log_writer) {
     logs_to_free_queue_.push_back(log_writer);
   }
@@ -727,8 +729,6 @@ class DBImpl : public DB {
                           uint64_t* seq_used = nullptr, size_t batch_cnt = 0,
                           PreReleaseCallback* pre_release_callback = nullptr);
 
-  uint64_t FindMinLogContainingOutstandingPrep();
-  uint64_t FindMinPrepLogReferencedByMemTable();
   // write cached_recoverable_state_ to memtable if it is not empty
   // The writer must be the leader in write_thread_ and holding mutex_
   Status WriteRecoverableState();
@@ -798,7 +798,8 @@ class DBImpl : public DB {
   void DeleteObsoleteFiles();
   // Delete obsolete files and log status and information of file deletion
   void DeleteObsoleteFileImpl(int job_id, const std::string& fname,
-                              FileType type, uint64_t number);
+                              const std::string& path_to_sync, FileType type,
+                              uint64_t number);
 
   // Background process needs to call
   //     auto x = CaptureCurrentFileNumberInPendingOutputs()
@@ -919,8 +920,8 @@ class DBImpl : public DB {
   void MaybeScheduleFlushOrCompaction();
   void SchedulePendingFlush(ColumnFamilyData* cfd, FlushReason flush_reason);
   void SchedulePendingCompaction(ColumnFamilyData* cfd);
-  void SchedulePendingPurge(std::string fname, FileType type, uint64_t number,
-                            int job_id);
+  void SchedulePendingPurge(std::string fname, std::string dir_to_sync,
+                            FileType type, uint64_t number, int job_id);
   static void BGWorkCompaction(void* arg);
   // Runs a pre-chosen universal compaction involving bottom level in a
   // separate, bottom-pri thread pool.
@@ -1164,11 +1165,13 @@ class DBImpl : public DB {
   // purge_queue_
   struct PurgeFileInfo {
     std::string fname;
+    std::string dir_to_sync;
     FileType type;
     uint64_t number;
     int job_id;
-    PurgeFileInfo(std::string fn, FileType t, uint64_t num, int jid)
-        : fname(fn), type(t), number(num), job_id(jid) {}
+    PurgeFileInfo(std::string fn, std::string d, FileType t, uint64_t num,
+                  int jid)
+        : fname(fn), dir_to_sync(d), type(t), number(num), job_id(jid) {}
   };
 
   // flush_queue_ and compaction_queue_ hold column families that we need to
@@ -1298,7 +1301,7 @@ class DBImpl : public DB {
   // We must attempt to free the dependent memtables again
   // at a later time after the transaction in the oldest
   // log is fully commited.
-  bool unable_to_flush_oldest_log_;
+  bool unable_to_release_oldest_log_;
 
   static const int KEEP_LOG_FILE_NUM = 1000;
   // MSVC version 1800 still does not have constexpr for ::max()
@@ -1335,33 +1338,7 @@ class DBImpl : public DB {
   // Indicate DB was opened successfully
   bool opened_successfully_;
 
-  // REQUIRES: logs_with_prep_mutex_ held
-  //
-  // sorted list of log numbers still containing prepared data.
-  // this is used by FindObsoleteFiles to determine which
-  // flushed logs we must keep around because they still
-  // contain prepared data which has not been committed or rolled back
-  struct LogCnt {
-    uint64_t log;  // the log number
-    uint64_t cnt;  // number of prepared sections in the log
-  };
-  std::vector<LogCnt> logs_with_prep_;
-  std::mutex logs_with_prep_mutex_;
-
-  // REQUIRES: prepared_section_completed_mutex_ held
-  //
-  // to be used in conjunction with logs_with_prep_.
-  // once a transaction with data in log L is committed or rolled back
-  // rather than updating logs_with_prep_ directly we keep track of that
-  // in prepared_section_completed_ which maps LOG -> instance_count. This helps
-  // avoiding contention between a commit thread and the prepare threads.
-  //
-  // when trying to determine the minimum log still active we first
-  // consult logs_with_prep_. while that root value maps to
-  // an equal value in prepared_section_completed_ we erase the log from
-  // both logs_with_prep_ and prepared_section_completed_.
-  std::unordered_map<uint64_t, uint64_t> prepared_section_completed_;
-  std::mutex prepared_section_completed_mutex_;
+  LogsWithPrepTracker logs_with_prep_tracker_;
 
   // Callback for compaction to check if a key is visible to a snapshot.
   // REQUIRES: mutex held
@@ -1456,6 +1433,25 @@ extern DBOptions SanitizeOptions(const std::string& db, const DBOptions& src);
 extern CompressionType GetCompressionFlush(
     const ImmutableCFOptions& ioptions,
     const MutableCFOptions& mutable_cf_options);
+
+// Return the earliest log file to keep after the memtable flush is
+// finalized.
+// `cfd_to_flush` is the column family whose memtable (specified in
+// `memtables_to_flush`) will be flushed and thus will not depend on any WAL
+// file.
+// The function is only applicable to 2pc mode.
+extern uint64_t PrecomputeMinLogNumberToKeep(
+    VersionSet* vset, const ColumnFamilyData& cfd_to_flush,
+    autovector<VersionEdit*> edit_list,
+    const autovector<MemTable*>& memtables_to_flush,
+    LogsWithPrepTracker* prep_tracker);
+
+// `cfd_to_flush` is the column family whose memtable will be flushed and thus
+// will not depend on any WAL file. nullptr means no memtable is being flushed.
+// The function is only applicable to 2pc mode.
+extern uint64_t FindMinPrepLogReferencedByMemTable(
+    VersionSet* vset, const ColumnFamilyData* cfd_to_flush,
+    const autovector<MemTable*>& memtables_to_flush);
 
 // Fix user-supplied options to be reasonable
 template <class T, class V>
